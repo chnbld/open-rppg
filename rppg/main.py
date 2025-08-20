@@ -9,6 +9,7 @@ import heartpy as hp
 import cv2
 import threading
 import time
+from scipy.interpolate import CubicSpline
 from scipy.signal import welch, butter, lfilter, filtfilt, find_peaks, resample
 from scipy.sparse import spdiags, diags, eye
 from scipy.sparse.linalg import spsolve
@@ -57,11 +58,11 @@ def get_hr(y, sr=30, min_hr=30, max_hr=180):
 
 def get_prv(y, sr=30):
     m, n = hp.process(y, sr, high_precision=True, clean_rr=True)
-    peak_times = np.array(m['peaklist'])/20
-    rr_intervals = np.diff(peak_times)
+    rr_intervals = m['RR_list'][np.where(1-np.array(m['RR_masklist']))]/1000
     t = np.cumsum(rr_intervals)
     resampled_rate = 4 
-    signal = resample(rr_intervals, int(t[-1]*resampled_rate)) 
+    #signal = resample(rr_intervals, int(t[-1]*resampled_rate)) 
+    signal = CubicSpline(t, rr_intervals)(np.arange(0, t[-1], 1/resampled_rate))
     f, Pxx = welch(signal, fs=resampled_rate, nperseg=min(len(signal), 256), nfft=4096)
     VLF = Pxx[(f >= 0.0033) & (f < 0.04)].sum()
     LF  = Pxx[(f >= 0.04)   & (f < 0.15)].sum()
