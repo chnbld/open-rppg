@@ -52,11 +52,15 @@ def SQI(signal, sr=30, min_freq=0.5, max_freq=3.0):
     peak_value = np.max(target_autocorr)
     return max(0.0, min(1.0, peak_value))
 
-def get_hr(y, sr=30, min_hr=30, max_hr=180):
-    p, q = welch(y, sr, nfft=1e5/sr, nperseg=np.min((len(y)-1, 256/30*sr)))
-    return p[(p>min_hr/60)&(p<max_hr/60)][np.argmax(q[(p>min_hr/60)&(p<max_hr/60)])]*60
+def get_hr(y, sr=30, min=30, max=180):
+    p, q = welch(y, sr, nfft=2e4, nperseg=np.min((len(y)-1, 256/30*sr)))
+    return p[(p>min/60)&(p<max/60)][np.argmax(q[(p>min/60)&(p<max/60)])]*60
 
-def get_prv(y, sr=30):
+def get_prv(y, ts=None, sr=30):
+    if ts is not None and len(ts)>2:
+        y, ts = np.array([(y[i], ts[i]) for i in range(len(y)-1) if ts[i]!=ts[i+1]]+[(y[-1], ts[-1])]).T
+        y = CubicSpline(ts, y)(np.linspace(ts[0], ts[-1], (ts[-1]-ts[0])*120))
+        sr = 120
     m, n = hp.process(y, sr, high_precision=True, clean_rr=True)
     rr_intervals = m['RR_list'][np.where(1-np.array(m['RR_masklist']))]/1000
     t = np.cumsum(rr_intervals)
@@ -103,7 +107,7 @@ def norm_bvp(bvp, sr=30):
     return np.clip(bvp_, np.min(bvp), np.max(bvp))
 
 def detrend(signal, min_freq=0.5, sr=30):
-    Lambda = 50*(30/sr)**2*(0.5/min_freq)**2
+    Lambda = 50*(sr/30)**2*(0.5/min_freq)**2
     signal_length = signal.shape[0]
     diags_data = [
         np.ones(signal_length - 2),
@@ -197,6 +201,8 @@ class Model:
         self.run = None
         self.frame = None
         self.box = None 
+        self.rbox = None
+        self.hasface = 0
         self.alive = False
         self.preview_lock = threading.Lock()
         self.preview_lock.acquire()
@@ -211,7 +217,7 @@ class Model:
         model_asset_path = pkg_resources.resource_filename('rppg','weights/blaze_face_short_range.tflite')
         options = FaceDetectorOptions(
             base_options=BaseOptions(model_asset_path=model_asset_path),
-            running_mode=VisionRunningMode.VIDEO)
+            running_mode=VisionRunningMode.VIDEO, min_detection_confidence=0.8)
         self.boxkf = None
         self.ts = []
         self.n_frame = 0 
@@ -229,7 +235,10 @@ class Model:
                     if len(self.face_buff)<self.meta['input'][0]:
                         continue 
                     face_imgs = self.face_buff[:self.meta['input'][0]]
-                    r, self.state = self.call(np.array(face_imgs), self.state)
+                    ipt = np.array([i[0] for i in face_imgs])
+                    msk = np.array([i[1] for i in face_imgs], bool)
+                    r, self.state = self.call(ipt, self.state)
+                    r = {k:v*msk for k,v in r.items() if v.shape[-1]==len(msk)}
                     with self.frame_lock:
                         for i in range(self.meta['input'][0]):
                             self.face_buff.pop(0)
@@ -237,7 +246,10 @@ class Model:
                     self.signal_buff.append(r)
                 if len(self.face_buff):
                     face_imgs = self.face_buff + [self.face_buff[-1]]*(self.meta['input'][0]-len(self.face_buff))
-                    r, _ = self.call(np.array(face_imgs), self.state)
+                    ipt = np.array([i[0] for i in face_imgs])
+                    msk = np.array([i[1] for i in face_imgs], bool)
+                    r, _ = self.call(ipt, self.state)
+                    r = {k:v*msk for k,v in r.items() if v.shape[-1]==len(msk)}
                     self.n_signal += len(self.face_buff)
                     self.signal_buff.append({k:v[:len(self.face_buff)] for k,v in r.items()})
                     self.face_buff.clear()
@@ -302,6 +314,8 @@ class Model:
         
     def bvp(self, start=0, end=None, raw=False):
         signals, ts = self.collect_signals(start, end)
+        if 'bvp' not in signals or ts[-1]-ts[0]<2:
+            return [], []
         bvp = signals['bvp']
         if self.meta.get('cumsum_output'):
             bvp = np.cumsum(bvp)
@@ -311,15 +325,17 @@ class Model:
         
     def hr(self, start=0, end=None):
         if self.has_signal:
-            bvp, _ = self.bvp(start, end)
+            bvp, ts = self.bvp(start, end)
             try:
-                hrv = get_prv(bvp, self.fps)
+                hrv = get_prv(bvp, ts, self.fps)
+                hr  = get_hr(bvp, self.fps)
+                sqi = SQI(bvp)
             except:
-                hrv = {}
-            return {'hr':get_hr(bvp, self.fps), 'SQI':SQI(bvp), 'hrv':hrv, 'latency':self.latency}
+                hr, sqi, hrv = None, None, {}
+            return {'hr':hr, 'SQI':sqi, 'hrv':hrv, 'latency':self.latency}
         return None
     
-    def update_face(self, face_img, ts=None):
+    def update_face(self, face_img, hasface=True, ts=None):
         if face_img is None:
             return
         if ts is None:
@@ -329,7 +345,10 @@ class Model:
         while self.n_frame/self.fps<=ts-(self.ts+[ts])[0]:
             with self.frame_lock:
                 self.ts.append(ts)
-                self.face_buff.append(face_img)
+                if hasface:
+                    self.face_buff.append((face_img, hasface))
+                else:
+                    self.face_buff.append((np.zeros_like(face_img), hasface))
             self.n_frame += 1
             self.sp.release()
         
@@ -345,20 +364,25 @@ class Model:
                 box = r.detections[0].bounding_box
                 box = np.array([(box.origin_y-round(box.height*0.2), box.origin_y+round(box.height*0.9)),(box.origin_x, box.width+box.origin_x)])
                 box[box<0] = 0
+                self.hasface = ts + 1
+            elif self.box is None or ts+1-self.hasface>1 or (self.rbox[:,0]<=np.array(0.05)*frame.shape[:2]).any() or (self.rbox[:,1]>=np.array(0.95)*frame.shape[:2]).any():
+                self.hasface = 0
         if box is not None:
             if self.boxkf is None:
-                self.boxkf = [KalmanFilter1D(0.01,0.5,i,1) for i in box.reshape(-1)]
+                kbox, self.boxkf = box, [KalmanFilter1D(0.01,0.5,i,1) for i in box.reshape(-1)]
             else:
                 dt = ts-self.ts[-1] if self.ts else None
-                box = np.array([round(k.update(i, dt)) for k, i in zip(self.boxkf, box.reshape(-1))]).reshape((2,2))
-            self.box = box
+                kbox = np.array([round(k.update(i, dt)) for k, i in zip(self.boxkf, box.reshape(-1))]).reshape((2,2))
+            self.rbox = box
+            if self.box is None or max(np.abs((np.mean(kbox, axis=1)-np.mean(self.box, axis=1)))/np.mean(self.box, axis=0))>0.02:
+                self.box = kbox
         if self.box is not None:
-            img = np.ascontiguousarray(img.numpy_view()[slice(*self.box[0]), slice(*self.box[1])])
+            img = np.ascontiguousarray(frame[slice(*self.box[0]), slice(*self.box[1])])
         else:
             img = None 
         if self.preview_lock.locked():
             self.preview_lock.release()
-        self.update_face(img, ts)
+        self.update_face(img, self.hasface, ts)
     
     def video_capture(self, vid_path=0):
         if self.run is not None:
