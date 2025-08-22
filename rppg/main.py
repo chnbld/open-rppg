@@ -307,7 +307,6 @@ class Model:
         return bool(self.n_signal)
     
     def process_bvp(self, bvp):
-        bvp = detrend(bvp, sr=self.fps)
         bvp = bandpass_filter(bvp, fs=self.fps)
         bvp = norm_bvp(bvp)
         return bvp
@@ -319,6 +318,7 @@ class Model:
         bvp = signals['bvp']
         if self.meta.get('cumsum_output'):
             bvp = np.cumsum(bvp)
+            bvp = detrend(bvp, sr=self.fps)
         if not raw:
             bvp = self.process_bvp(bvp)
         return bvp, ts

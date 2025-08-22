@@ -1533,9 +1533,11 @@ def load_TSCAN_rlap():
     @jax.jit
     def call(x, state):
         x = x[None]/255.
-        y = model(x)
-        return {'bvp':y[0]}, state
-    call(np.zeros((160,36,36,3), dtype='uint8'), state)
+        y = model(x)[0]
+        y = jnp.cumsum(y)
+        y = (y-jnp.mean(y))/(jnp.std(y)+1e-6)
+        y = jnp.diff(jnp.concat([jnp.array([0]), y], axis=0))
+        return {'bvp':y}, state
     return call, state, {'fps':30., 'input':(160, 36, 36, 3), 'cumsum_output':True}
 
 @lru_cache(maxsize=1)
@@ -1546,9 +1548,11 @@ def load_TSCAN_pure():
     @jax.jit
     def call(x, state):
         x = x[None]/255.
-        y = model(x)
-        return {'bvp':y[0]}, state
-    call(np.zeros((160,36,36,3), dtype='uint8'), state)
+        y = model(x)[0]
+        y = jnp.cumsum(y)
+        y = (y-jnp.mean(y))/(jnp.std(y)+1e-6)
+        y = jnp.diff(jnp.concat([jnp.array([0]), y], axis=0))
+        return {'bvp':y}, state
     return call, state, {'fps':30., 'input':(160, 36, 36, 3), 'cumsum_output':True}
 
 class PhysNet(keras.Model):
@@ -1751,8 +1755,11 @@ def load_EfficientPhys_rlap():
     @jax.jit
     def call(x, state):
         x = x[None]/255.
-        y = model(x)
-        return {'bvp':y[0]}, state
+        y = model(x)[0]
+        y = jnp.cumsum(y)
+        y = (y-jnp.mean(y))/(jnp.std(y)+1e-6)
+        y = jnp.diff(jnp.concat([jnp.array([0]), y], axis=0))
+        return {'bvp':y}, state
     call(np.zeros((160,72,72,3), dtype='uint8'), state)
     return call, state, {'fps':30., 'input':(160, 72, 72, 3), 'cumsum_output':True}
 
@@ -1764,7 +1771,10 @@ def load_EfficientPhys_pure():
     @jax.jit
     def call(x, state):
         x = x[None]/255.
-        y = model(x)
-        return {'bvp':y[0]}, state
+        y = model(x)[0]
+        y = jnp.cumsum(y)
+        y = (y-jnp.mean(y))/(jnp.std(y)+1e-6)
+        y = jnp.diff(jnp.concat([jnp.array([0]), y], axis=0))
+        return {'bvp':y}, state
     call(np.zeros((160,72,72,3), dtype='uint8'), state)
     return call, state, {'fps':30., 'input':(160, 72, 72, 3), 'cumsum_output':True}
