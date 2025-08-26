@@ -59,7 +59,7 @@ def get_hr(y, sr=30, min=30, max=180):
 def get_prv(y, ts=None, sr=30):
     if ts is not None and len(ts)>2:
         y, ts = np.array([(y[i], ts[i]) for i in range(len(y)-1) if ts[i]!=ts[i+1]]+[(y[-1], ts[-1])]).T
-        y = CubicSpline(ts, y)(np.linspace(ts[0], ts[-1], (ts[-1]-ts[0])*120))
+        y = CubicSpline(ts, y)(np.linspace(ts[0], ts[-1], round((ts[-1]-ts[0])*120)))
         sr = 120
     m, n = hp.process(y, sr, high_precision=True, clean_rr=True)
     rr_intervals = m['RR_list'][np.where(1-np.array(m['RR_masklist']))]/1000
@@ -223,7 +223,7 @@ class Model:
         self.n_frame = 0 
         self.n_signal = 0
         self.face_buff = []
-        self.signal_buff = []
+        self.signal_buff = {}
         self.sp = threading.Semaphore(0)
         self.frame_lock = threading.Lock()
         self.detector = FaceDetector.create_from_options(options) 
@@ -243,7 +243,11 @@ class Model:
                         for i in range(self.meta['input'][0]):
                             self.face_buff.pop(0)
                     self.n_signal += self.meta['input'][0]
-                    self.signal_buff.append(r)
+                    if not self.signal_buff:
+                        self.signal_buff = {k:list(v) for k,v in r.items()}
+                    else:
+                        for k, v in self.signal_buff.items():
+                            v.extend(r[k])
                 if len(self.face_buff):
                     face_imgs = self.face_buff + [self.face_buff[-1]]*(self.meta['input'][0]-len(self.face_buff))
                     ipt = np.array([i[0] for i in face_imgs])
@@ -251,7 +255,9 @@ class Model:
                     r, _ = self.call(ipt, self.state)
                     r = {k:v*msk for k,v in r.items() if v.shape[-1]==len(msk)}
                     self.n_signal += len(self.face_buff)
-                    self.signal_buff.append({k:v[:len(self.face_buff)] for k,v in r.items()})
+                    #self.signal_buff.append({k:v[:len(self.face_buff)] for k,v in r.items()})
+                    for k, v in self.signal_buff.items():
+                        v.extend(r[k][:len(self.face_buff)])
                     self.face_buff.clear()
             except Exception as e:
                 import sys
@@ -283,7 +289,8 @@ class Model:
             return {}, None
         if not start<end:
             raise ValueError('Start must be less than end')
-        signals = {k:np.concatenate([i[k] for i in self.signal_buff]) for k in self.signal_buff[0]}
+        #signals = {k:np.concatenate([i[k] for i in self.signal_buff]) for k in self.signal_buff[0]}
+        signals = self.signal_buff
         start_n, end_n = 0, None
         for n, i in enumerate(np.array(self.ts)-self.ts[0]):
             if start and i<start:
@@ -332,6 +339,8 @@ class Model:
                 sqi = SQI(bvp)
             except:
                 hr, sqi, hrv = None, None, {}
+                import sys
+                sys.excepthook(*sys.exc_info())
             return {'hr':hr, 'SQI':sqi, 'hrv':hrv, 'latency':self.latency}
         return None
     
