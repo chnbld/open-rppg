@@ -57,10 +57,12 @@ def get_hr(y, sr=30, min=30, max=180):
     return p[(p>min/60)&(p<max/60)][np.argmax(q[(p>min/60)&(p<max/60)])]*60
 
 def get_prv(y, ts=None, sr=30):
+    '''
     if ts is not None and len(ts)>2:
         y, ts = np.array([(y[i], ts[i]) for i in range(len(y)-1) if ts[i]!=ts[i+1]]+[(y[-1], ts[-1])]).T
         y = CubicSpline(ts, y)(np.linspace(ts[0], ts[-1], round((ts[-1]-ts[0])*120)))
         sr = 120
+    '''
     m, n = hp.process(y, sr, high_precision=True, clean_rr=True)
     rr_intervals = m['RR_list'][np.where(1-np.array(m['RR_masklist']))]/1000
     t = np.cumsum(rr_intervals)
@@ -104,7 +106,7 @@ def norm_bvp(bvp, sr=30):
     bvp = np.concatenate([i[:-1] for i in l[:-1]]+l[-1:])
     bvp = (bvp-np.mean(bvp))/np.std(bvp)
     bvp_[peaks[0]:peaks[-1]+1] = bvp
-    return np.clip(bvp_, np.min(bvp), np.max(bvp))
+    return np.clip(bvp_, -2, np.max(bvp))
 
 def detrend(signal, min_freq=0.5, sr=30):
     Lambda = 50*(sr/30)**2*(0.5/min_freq)**2
