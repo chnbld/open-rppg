@@ -1662,7 +1662,7 @@ def load_PhysNet(weight):
 @lru_cache(maxsize=1)
 def load_PhysNet_rlap():
     weights_path = pkg_resources.resource_filename(
-        'rppg','weights/PhysNet.rlap.weights.h5')
+        'rppg','weights/physnet.rlap.weights.h5')
     model, state = load_PhysNet(weights_path)
     @jax.jit
     def call(x, state):
@@ -1675,7 +1675,7 @@ def load_PhysNet_rlap():
 @lru_cache(maxsize=1)
 def load_PhysNet_pure():
     weights_path = pkg_resources.resource_filename(
-        'rppg','weights/PhysNet.pure.weights.h5')
+        'rppg','weights/physnet.pure.weights.h5')
     model, state = load_PhysNet(weights_path)
     @jax.jit
     def call(x, state):
