@@ -289,7 +289,7 @@ class Model:
             end += self.now
         if not self.signal_buff:
             return {}, None
-        if not start<end:
+        if not start<=end:
             raise ValueError('Start must be less than end')
         #signals = {k:np.concatenate([i[k] for i in self.signal_buff]) for k in self.signal_buff[0]}
         signals = self.signal_buff
