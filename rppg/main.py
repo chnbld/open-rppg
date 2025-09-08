@@ -341,8 +341,6 @@ class Model:
                 sqi = SQI(bvp)
             except:
                 hr, sqi, hrv = None, None, {}
-                import sys
-                sys.excepthook(*sys.exc_info())
             return {'hr':hr, 'SQI':sqi, 'hrv':hrv, 'latency':self.latency}
         return None
     
