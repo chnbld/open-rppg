@@ -1,5 +1,12 @@
 import warnings
 warnings.filterwarnings('ignore', category=UserWarning)
+import logging
+logger = logging.getLogger('open-rppg')
+handler = logging.StreamHandler()
+formatter = logging.Formatter('OPEN-RPPG:%(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 from .models import * 
 
@@ -192,6 +199,8 @@ class Model:
         if model == 'EfficientPhys.pure':
             f, state, meta = load_EfficientPhys_pure()
         self.__load(f, state, meta)
+        with self:
+            pass
     
     def __load(self, func, state, meta, face_detect_per_n=1):
         self.state = state 
@@ -202,9 +211,6 @@ class Model:
         self.call = func 
         self.run = None
         self.frame = None
-        self.box = None 
-        self.rbox = None
-        self.hasface = 0
         self.alive = False
         self.preview_lock = threading.Lock()
         self.preview_lock.acquire()
@@ -219,13 +225,17 @@ class Model:
         model_asset_path = pkg_resources.resource_filename('rppg','weights/blaze_face_short_range.tflite')
         options = FaceDetectorOptions(
             base_options=BaseOptions(model_asset_path=model_asset_path),
-            running_mode=VisionRunningMode.VIDEO, min_detection_confidence=0.8)
+            running_mode=VisionRunningMode.VIDEO, min_detection_confidence=0.5)
         self.boxkf = None
         self.ts = []
         self.n_frame = 0 
         self.n_signal = 0
+        self.box = None 
+        self.rbox = None 
+        self.hasface = 0
         self.face_buff = []
         self.signal_buff = {}
+        self.statistic = {'frames':0, 'key':0, 'skipped':0, 'filled':0, 'dependent':0, 'null':0}
         self.sp = threading.Semaphore(0)
         self.frame_lock = threading.Lock()
         self.detector = FaceDetector.create_from_options(options) 
@@ -316,15 +326,26 @@ class Model:
         return bool(self.n_signal)
     
     def process_bvp(self, bvp):
-        bvp = bandpass_filter(bvp, fs=self.fps)
-        bvp = norm_bvp(bvp)
-        return bvp
+        try:
+            bvp = bandpass_filter(bvp, fs=self.fps)
+            bvp = norm_bvp(bvp, sr=self.fps)
+            return bvp
+        except:
+            logger.warning("Filtering failure.")
+            return bvp 
+    
+    @property
+    def video_statistic(self):
+        data = self.statistic
+        return f"Total Frames: {data['frames']}\nKey Frames: {data['key']}\nNon-Key Frames: {data['dependent']}\nSkipped Frames: {data['skipped']}\nForward Filled Frames: {data['filled']}\nNo Face Detected Frames: {data['null']}"
         
     def bvp(self, start=0, end=None, raw=False):
         signals, ts = self.collect_signals(start, end)
         if 'bvp' not in signals or ts[-1]-ts[0]<2:
             return [], []
         bvp = signals['bvp']
+        if len(bvp)<self.fps*2:
+            return [], []
         if self.meta.get('cumsum_output'):
             bvp = np.cumsum(bvp)
             bvp = detrend(bvp, sr=self.fps)
@@ -346,20 +367,28 @@ class Model:
     
     def update_face(self, face_img, ts=None, hasface=True):
         if face_img is None:
-            return
+            if not hasface:
+                face_img = np.zeros(self.input[1:], dtype='uint8')
+                self.statistic['null'] += 1
+            else:
+                return
         if ts is None:
             ts = time.time()
         resolution = self.input[1:3]
         face_img = cv2.resize(face_img, resolution, interpolation=cv2.INTER_AREA)
+        n = 0
         while (self.n_frame-0.3)/self.fps<=ts-(self.ts+[ts])[0]:
             with self.frame_lock:
                 self.ts.append(ts)
-                if hasface:
-                    self.face_buff.append((face_img, hasface))
-                else:
-                    self.face_buff.append((np.zeros_like(face_img), hasface))
+                self.statistic['frames'] += 1
+                if n>0 :
+                    self.statistic['filled'] += 1
+                self.face_buff.append((face_img, hasface))
             self.n_frame += 1
             self.sp.release()
+            n += 1
+        if n==0:
+            self.statistic['skipped'] += 1
         
     def update_frame(self, frame, ts=None):
         if ts is None:
@@ -391,7 +420,7 @@ class Model:
             img = None 
         if self.preview_lock.locked():
             self.preview_lock.release()
-        self.update_face(img, self.hasface, ts)
+        self.update_face(img, ts, self.hasface)
     
     def video_capture(self, vid_path=0):
         if self.run is not None:
@@ -435,10 +464,16 @@ class Model:
         container = av.open(vid_path, options={"hwaccel": "cuda"})
         stream = container.streams.video[0]
         stream.thread_type = 'AUTO'
+        tsarr = []
         with self:
             for frame in container.decode(stream):
+                if frame.key_frame:
+                    self.statistic['key'] += 1
+                else:
+                    self.statistic['dependent'] += 1
                 rotation = -frame.rotation%360
                 ts = frame.time
+                tsarr.append(ts)
                 img = frame.to_ndarray(format='rgb24')
                 if rotation == 90:
                     img = img.swapaxes(0, 1)[:, ::-1, :]
@@ -447,6 +482,23 @@ class Model:
                 elif rotation == 270:
                     img = img.swapaxes(0, 1)[::-1, :, :]
                 self.update_frame(img, ts)
+        container.close()
+        if len(tsarr)>2:
+            goodvid = True
+            fps = 1/np.diff(tsarr)
+            fps_std = np.std(fps)
+            fps = np.mean(fps)
+            if not (self.fps*0.95<fps<self.fps*1.05):
+                logger.warning('Frame rate mismatch, performing nearest neighbor sampling.')
+                goodvid = False
+            if fps_std>0.05*fps:
+                logger.warning('Frame rate is unstable, performing nearest neighbor sampling.')
+                goodvid = False
+            if self.statistic['dependent']>0:
+                logger.warning('Detected non-key frames, this will damage the rPPG signal. For information on key frames, see https://en.wikipedia.org/wiki/I-frame. \nPlease use https://github.com/KegangWangCCNU/PhysRecorder to record videos that only contain key frames.')
+                goodvid = False
+            if not goodvid:
+                logger.info('\n'+self.video_statistic)
         return self.hr()
             
     
