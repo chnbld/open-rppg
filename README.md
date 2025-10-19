@@ -2,7 +2,7 @@
 An easy-to-use rPPG inference toolbox
 
 ## ⚙️ Installation 
-Python >= 3.9
+Python >= 3.9 & <= 3.12
 ```bash
 pip install open-rppg
 ```
