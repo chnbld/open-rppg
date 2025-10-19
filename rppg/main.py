@@ -344,14 +344,14 @@ class Model:
             return {'hr':hr, 'SQI':sqi, 'hrv':hrv, 'latency':self.latency}
         return None
     
-    def update_face(self, face_img, hasface=True, ts=None):
+    def update_face(self, face_img, ts=None, hasface=True):
         if face_img is None:
             return
         if ts is None:
             ts = time.time()
         resolution = self.input[1:3]
         face_img = cv2.resize(face_img, resolution, interpolation=cv2.INTER_AREA)
-        while self.n_frame/self.fps<=ts-(self.ts+[ts])[0]:
+        while (self.n_frame-0.3)/self.fps<=ts-(self.ts+[ts])[0]:
             with self.frame_lock:
                 self.ts.append(ts)
                 if hasface:
