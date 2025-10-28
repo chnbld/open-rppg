@@ -1,7 +1,7 @@
 heartpy>=1.2
 jax>=0.4.26,<0.7
 keras>=3.5.0,<=4
-mediapipe>=0.10,<0.11
+onnxruntime>=1.8
 opencv_python>=4.5.5.64,<4.12
 scipy>=1.8,<1.15
 einops~=0.8 

@@ -10,11 +10,12 @@ logger.setLevel(logging.INFO)
 
 from .models import * 
 
+import onnxruntime as ort
 import av
-import mediapipe as mp
 import heartpy as hp
 import cv2
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 from scipy.interpolate import CubicSpline
 from scipy.signal import welch, butter, lfilter, filtfilt, find_peaks, resample
@@ -156,6 +157,226 @@ class KalmanFilter1D:
         self.estimate_error = (1 - kalman_gain) * prediction_error
         return self.estimate
 
+class FaceDetector:
+    def __init__(self, model_path, score_threshold=0.5, iou_threshold=0.3):
+        self.session = ort.InferenceSession(model_path)
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_names = [output.name for output in self.session.get_outputs()]
+        
+        input_shape = self.session.get_inputs()[0].shape
+        self.input_size = input_shape[2]
+        
+        if self.input_size == 128:
+            self.strides = [8, 16, 16, 16]
+            self.anchor_offset = 0.5
+            self.anchors = self._generate_anchors_short()
+        else:
+            self.strides = [4]
+            self.anchor_offset = 0.5
+            self.num_layers = 1
+            self.interpolated_scale_aspect_ratio = 0.0
+            self.anchors = self._generate_anchors_full()
+        
+        self.score_threshold = score_threshold
+        self.iou_threshold = iou_threshold
+    
+    def _generate_anchors_short(self):
+        anchors = []
+        for stride in self.strides:
+            feature_map_size = self.input_size // stride
+            for y in range(feature_map_size):
+                for x in range(feature_map_size):
+                    for _ in range(2):
+                        x_center = (x + self.anchor_offset) / feature_map_size
+                        y_center = (y + self.anchor_offset) / feature_map_size
+                        anchors.append([x_center, y_center])
+        return np.array(anchors, dtype=np.float32)
+    
+    def _generate_anchors_full(self):
+        anchors = []
+        layer_id = 0
+        
+        while layer_id < self.num_layers:
+            last_same_stride_layer = layer_id
+            repeats = 0
+            
+            while (last_same_stride_layer < self.num_layers and 
+                   self.strides[last_same_stride_layer] == self.strides[layer_id]):
+                last_same_stride_layer += 1
+                repeats += 2 if self.interpolated_scale_aspect_ratio == 1.0 else 1
+            
+            stride = self.strides[layer_id]
+            feature_map_height = self.input_size // stride
+            feature_map_width = self.input_size // stride
+            
+            for y in range(feature_map_height):
+                for x in range(feature_map_width):
+                    y_center = (y + self.anchor_offset) / feature_map_height
+                    x_center = (x + self.anchor_offset) / feature_map_width
+                    
+                    for _ in range(repeats):
+                        anchors.append([x_center, y_center])
+            
+            layer_id = last_same_stride_layer
+        
+        return np.array(anchors, dtype=np.float32)
+    
+    def _sigmoid(self, x):
+        return 1.0 / (1.0 + np.exp(-np.clip(x, -80, 80)))
+    
+    def preprocess(self, image):
+        h, w = image.shape[:2]
+        scale = min(self.input_size / w, self.input_size / h)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        
+        resized = cv2.resize(image, (new_w, new_h))
+        padded = np.full((self.input_size, self.input_size, 3), 0, dtype=np.uint8)
+        y_offset = (self.input_size - new_h) // 2
+        x_offset = (self.input_size - new_w) // 2
+        padded[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
+        
+        normalized = (padded.astype(np.float32) / 255.0 - 0.5) / 0.5
+        return normalized[None,], (x_offset, y_offset, new_w, new_h, scale)
+    
+    def _decode_boxes(self, raw_boxes, valid_indices):
+        num_boxes = len(valid_indices)
+        boxes_xyxy = np.zeros((num_boxes, 4))
+        
+        for i, idx in enumerate(valid_indices):
+            anchor = self.anchors[idx]
+            
+            dx = raw_boxes[idx, 0] / self.input_size
+            dy = raw_boxes[idx, 1] / self.input_size
+            dw = raw_boxes[idx, 2] / self.input_size
+            dh = raw_boxes[idx, 3] / self.input_size
+            
+            cx = dx + anchor[0]
+            cy = dy + anchor[1]
+            
+            w = dw
+            h = dh
+            
+            xmin = cx - w*0.45
+            ymin = cy - h*0.6
+            xmax = cx + w*0.45
+            ymax = cy + h*0.5
+            
+            boxes_xyxy[i] = [xmin, ymin, xmax, ymax]
+        
+        return boxes_xyxy
+    
+    def _decode_keypoints(self, raw_boxes, valid_indices):
+        keypoints_list = []
+        
+        for idx in valid_indices:
+            anchor = self.anchors[idx]
+            keypoints = np.zeros((6, 2))
+            
+            for k in range(6):
+                kx = raw_boxes[idx, 4 + 2*k] / self.input_size + anchor[0]
+                ky = raw_boxes[idx, 4 + 2*k + 1] / self.input_size + anchor[1]
+                keypoints[k] = [kx, ky]
+            
+            keypoints_list.append(keypoints)
+        return keypoints_list
+    
+    def _nms(self, boxes, scores):
+        if len(boxes) == 0:
+            return []
+        
+        order = np.argsort(scores)[::-1]
+        boxes = boxes[order]
+        scores = scores[order]
+        
+        selected = []
+        
+        while len(order) > 0:
+            i = order[0, 0]
+            selected.append(i)
+            
+            if len(order) == 1:
+                break
+            
+            current_box = boxes[0]
+            other_boxes = boxes[1:]
+            
+            x1 = np.maximum(current_box[0,0], other_boxes[:,0, 0])
+            y1 = np.maximum(current_box[0,1], other_boxes[:,0, 1])
+            x2 = np.minimum(current_box[0,2], other_boxes[:,0, 2])
+            y2 = np.minimum(current_box[0,3], other_boxes[:,0, 3])
+            
+            intersection = np.maximum(0, x2 - x1) * np.maximum(0, y2 - y1)
+            
+            current_box = current_box[0]
+            other_boxes = other_boxes[0]
+            area_current = (current_box[2] - current_box[0]) * (current_box[3] - current_box[1])
+            area_others = (other_boxes[:, 2] - other_boxes[:, 0]) * (other_boxes[:, 3] - other_boxes[:, 1])
+            union = area_current + area_others - intersection
+            
+            iou = intersection / (union + 1e-8)
+            
+            keep_indices = np.where(iou <= self.iou_threshold)[0]
+            order = order[keep_indices + 1]
+            boxes = boxes[keep_indices + 1]
+            scores = scores[keep_indices + 1]
+        
+        return selected
+    
+    def _remove_padding(self, detections, padding_info):
+        x_offset, y_offset, new_w, new_h, scale = padding_info
+        
+        results = []
+        for bbox, keypoints, score in detections:
+            xmin = (bbox[0] * self.input_size - x_offset) / scale
+            ymin = (bbox[1] * self.input_size - y_offset) / scale
+            xmax = (bbox[2] * self.input_size - x_offset) / scale
+            ymax = (bbox[3] * self.input_size - y_offset) / scale
+            
+            bbox_relative = np.array([xmin, ymin, xmax, ymax])
+            
+            keypoints_relative = np.zeros_like(keypoints)
+            for i, kp in enumerate(keypoints):
+                kx = (kp[0] * self.input_size - x_offset) / scale
+                ky = (kp[1] * self.input_size - y_offset) / scale
+                keypoints_relative[i] = [kx, ky]
+            
+            results.append((bbox_relative, keypoints_relative, score))
+        
+        return results
+    
+    def detect(self, image):
+        input_tensor, padding_info = self.preprocess(image)
+        
+        outputs = self.session.run(self.output_names, {self.input_name: input_tensor})
+        raw_boxes, raw_scores = outputs
+        
+        raw_boxes = raw_boxes[0] 
+        raw_scores = raw_scores[0]
+        
+        scores = self._sigmoid(raw_scores)
+        
+        valid_indices = np.where(scores > self.score_threshold)[0]
+        if len(valid_indices) == 0:
+            return []
+        
+        valid_scores = scores[valid_indices]
+        
+        boxes_xyxy = self._decode_boxes(raw_boxes, valid_indices)
+        keypoints_list = self._decode_keypoints(raw_boxes, valid_indices)
+        
+        selected_indices = self._nms(boxes_xyxy, valid_scores)
+        results = []
+        for idx in selected_indices:
+            results.append((
+                boxes_xyxy[idx],
+                keypoints_list[idx],
+                valid_scores[idx]
+            ))
+        
+        results = self._remove_padding(results, padding_info)
+        
+        return results
 
 supported_models = ['ME-chunk.rlap', 'ME-flow.rlap', 'ME-chunk.pure', 'ME-flow.pure',
                            'PhysMamba.pure', 'PhysMamba.rlap', 'RhythmMamba.rlap', 'RhythmMamba.pure',
@@ -202,15 +423,17 @@ class Model:
         with self:
             pass
     
-    def __load(self, func, state, meta, face_detect_per_n=1):
+    def __load(self, func, state, meta):
         self.state = state 
         self.meta = meta 
         self.fps = meta['fps'] 
         self.input = meta['input'] 
-        self.detect_per_n = face_detect_per_n
+        self.face_mode = 'Near'
+        self.face_detection_thread = max(os.cpu_count()//2, 1)
+        self.face_detect_per_n = 1
         self.call = func 
-        self.run = None
-        self.frame = None
+        self.run = None 
+        self.frame = None 
         self.alive = False
         self.preview_lock = threading.Lock()
         self.preview_lock.acquire()
@@ -218,14 +441,6 @@ class Model:
     def __enter__(self):
         if self.alive:
             raise RuntimeError('A task is currently running!')
-        BaseOptions = mp.tasks.BaseOptions
-        FaceDetector = mp.tasks.vision.FaceDetector
-        FaceDetectorOptions = mp.tasks.vision.FaceDetectorOptions
-        VisionRunningMode = mp.tasks.vision.RunningMode
-        model_asset_path = pkg_resources.resource_filename('rppg','weights/blaze_face_short_range.tflite')
-        options = FaceDetectorOptions(
-            base_options=BaseOptions(model_asset_path=model_asset_path),
-            running_mode=VisionRunningMode.VIDEO, min_detection_confidence=0.5)
         self.boxkf = None
         self.ts = []
         self.n_frame = 0 
@@ -238,7 +453,14 @@ class Model:
         self.statistic = {'frames':0, 'key':0, 'skipped':0, 'filled':0, 'dependent':0, 'null':0}
         self.sp = threading.Semaphore(0)
         self.frame_lock = threading.Lock()
-        self.detector = FaceDetector.create_from_options(options) 
+        self.face_detection_semaphore = threading.Semaphore(self.face_detection_thread)
+        self.face_detection_pool = ThreadPoolExecutor(max_workers=self.face_detection_thread)
+        self.face_detection_chain_lock = None
+        self.face_detect_count = 0
+        if self.face_mode == 'Near':
+            self.detector = FaceDetector(pkg_resources.resource_filename('rppg','weights/blaze_face.onnx'))
+        else:
+            self.detector = FaceDetector(pkg_resources.resource_filename('rppg','weights/blaze_face_full.onnx'))
         self.alive = True
         def inference():
             try:
@@ -286,7 +508,7 @@ class Model:
             self.alive = False
             self.sp.release()
             self.ift.join()
-            self.detector.close()
+            self.face_detection_pool.shutdown()
                 
     def collect_signals(self, start=None, end=None):
         if not start:
@@ -381,7 +603,7 @@ class Model:
             with self.frame_lock:
                 self.ts.append(ts)
                 self.statistic['frames'] += 1
-                if n>0 :
+                if n>0:
                     self.statistic['filled'] += 1
                 self.face_buff.append((face_img, hasface))
             self.n_frame += 1
@@ -393,27 +615,49 @@ class Model:
     def update_frame(self, frame, ts=None):
         if ts is None:
             ts = time.time()
+        def detect(n, img, lock1, lock2, ts):
+            try:
+                if not n%self.face_detect_per_n:
+                    r = self.detector.detect(img)
+                    if len(r):
+                        r, _, _ = r[0]
+                        r = np.round(r).astype('int')
+                        r = np.array(((r[1],r[3]),(r[0],r[2])))
+                else:
+                    r = 'skipped'
+                if lock1 is not None:
+                    lock1.acquire()
+                lock2.release()
+                self.face_detection_semaphore.release()
+                self.__update_frame_box(img, ts, r)
+            except:
+                import sys
+                sys.excepthook(*sys.exc_info())
+        lock1 = self.face_detection_chain_lock 
+        self.face_detection_chain_lock = threading.Lock()
+        self.face_detection_chain_lock.acquire()
+        lock2 = self.face_detection_chain_lock 
+        self.face_detection_semaphore.acquire()
+        self.face_detection_pool.submit(lambda:detect(self.face_detect_count, frame, lock1, lock2, ts))
+        self.face_detect_count += 1
+        
+    def __update_frame_box(self, frame, ts=None, box=np.array([])):
         self.frame = frame
-        img = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(frame))
-        box = None
-        if self.n_frame%self.detect_per_n==0:
-            r = self.detector.detect_for_video(img, round(ts*1e6))
-            if len(r.detections):
-                box = r.detections[0].bounding_box
-                box = np.array([(box.origin_y-round(box.height*0.2), box.origin_y+round(box.height*0.9)),(box.origin_x, box.width+box.origin_x)])
+        if not isinstance(box, str):
+            if len(box):
                 box[box<0] = 0
                 self.hasface = ts + 1
             elif self.box is None or ts+1-self.hasface>1 or (self.rbox[:,0]<=np.array(0.05)*frame.shape[:2]).any() or (self.rbox[:,1]>=np.array(0.95)*frame.shape[:2]).any():
                 self.hasface = 0
-        if box is not None:
-            if self.boxkf is None:
-                kbox, self.boxkf = box, [KalmanFilter1D(0.01,0.5,i,1) for i in box.reshape(-1)]
-            else:
-                dt = ts-self.ts[-1] if self.ts else None
-                kbox = np.array([round(k.update(i, dt)) for k, i in zip(self.boxkf, box.reshape(-1))]).reshape((2,2))
-            self.rbox = box
-            if self.box is None or max(np.abs((np.mean(kbox, axis=1)-np.mean(self.box, axis=1)))/np.mean(self.box, axis=0))>0.02:
-                self.box = kbox
+            if len(box):
+                if self.boxkf is None:
+                    kbox, self.boxkf = box, [KalmanFilter1D(0.01,0.5,i,1) for i in box.reshape(-1)]
+                else:
+                    dt = ts-self.ts[-1] if self.ts else None
+                    kbox = np.array([round(k.update(i, dt)) for k, i in zip(self.boxkf, box.reshape(-1))]).reshape((2,2))
+                self.rbox = box
+                if self.box is None or max(np.abs((np.mean(kbox, axis=1)-np.mean(self.box, axis=1)))/np.mean(self.box, axis=0))>0.02:
+                    self.box = kbox
         if self.box is not None:
             img = np.ascontiguousarray(frame[slice(*self.box[0]), slice(*self.box[1])])
         else:
@@ -459,6 +703,30 @@ class Model:
         self.alive = False
         self.wait_completion()
         self.run = None
+        
+    def process_video_tensor(self, tensor, fps=30.):
+        # tensor shape (length, H, W, RGB) uint8
+        if tensor.dtype != 'uint8' or len(tensor.shape) != 4 or tensor.shape[-1] != 3:
+            raise TypeError("Only processes uint8 tensors with shape (length, H, W, RGB) and values in the range of 0 to 255.")
+        logger.warning('Tensor mode, video quality check disabled.')
+        with self:
+            ts = 0
+            for i in range(len(tensor)):
+                self.update_frame(tensor[i], ts)
+                ts += 1/fps
+        return self.hr()
+    
+    def process_faces_tensor(self, tensor, fps=30.):
+        # tensor shape (length, H, W, RGB) uint8
+        if tensor.dtype != 'uint8' or len(tensor.shape) != 4 or tensor.shape[-1] != 3:
+            raise TypeError("Only processes uint8 tensors with shape (length, H, W, RGB) and values in the range of 0 to 255.")
+        logger.warning('Tensor mode, video quality check disabled.')
+        with self:
+            ts = 0
+            for i in range(len(tensor)):
+                self.update_face(tensor[i], ts)
+                ts += 1/fps
+        return self.hr()
     
     def process_video(self, vid_path):
         container = av.open(vid_path, options={"hwaccel": "cuda"})
