@@ -4,3 +4,4 @@ uploads/*
 
 #ignore __pycache__ folder and its contents
 rppg/__pycache__/*
+.vercel

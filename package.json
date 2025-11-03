@@ -1,0 +1,8 @@
+{
+  "name": "open-rppg",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "pip install -r requirements.txt"
+  }
+}
+
