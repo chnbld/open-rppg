@@ -6,8 +6,15 @@ from werkzeug.utils import secure_filename
 import rppg
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
+
+# Use /tmp for Vercel serverless, 'uploads' for local development
+# Vercel provides /tmp directory with 512MB limit
+if os.path.exists('/tmp'):
+    app.config['UPLOAD_FOLDER'] = '/tmp/uploads'
+else:
+    app.config['UPLOAD_FOLDER'] = 'uploads'
+
+app.config['MAX_CONTENT_LENGTH'] = 450 * 1024 * 1024  # 450MB max (below Vercel's 500MB limit)
 app.config['ALLOWED_EXTENSIONS'] = {'mp4', 'avi', 'mov', 'mkv', 'webm'}
 
 # Create upload folder if it doesn't exist

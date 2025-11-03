@@ -1,11 +1,12 @@
 [project]
-name = "my-flask-app"
+name = "open-rppg"
 version = "0.1.0"
-requires-python = "<=3.12"
+requires-python = ">=3.9,<=3.12"
 
 [tool.setuptools]
-packages = ["."]
+packages = {find = {}}
+include-package-data = true
 
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
