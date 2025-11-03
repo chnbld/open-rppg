@@ -7,3 +7,5 @@ scipy>=1.8,<1.15
 einops~=0.8 
 av>=13 
 matplotlib<=3.9
+flask>=2.0.0
+werkzeug>=2.0.0
